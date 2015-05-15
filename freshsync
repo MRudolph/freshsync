@@ -131,11 +131,6 @@ implicit def pathWrapper(path: Path) = new PathHelper(path)
   }
 
 
-object AgeOrdering extends Ordering[SyncInfo] {
-  def compare(a:SyncInfo, b:SyncInfo) = a.syncAction compare b.syncAction
-}
-
-
 
 //########################
 // File-Pair Handling
