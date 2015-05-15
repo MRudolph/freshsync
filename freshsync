@@ -1,0 +1,281 @@
+#!/usr/bin/env scala
+
+
+
+import java.nio.file._
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
+import scala.collection.Traversable
+import scala.language.implicitConversions
+import scala.collection.immutable.TreeMap
+import java.nio.file.StandardCopyOption
+import scala.collection.mutable.TreeSet
+import scala.math.Ordering
+import scala.math
+
+
+//########################
+// File Discovery
+// see: http://stackoverflow.com/questions/8923336/how-to-use-java-nio-file-files-walkfiletree-in-scala
+//########################
+
+class PathHelper(path:Path) extends Traversable[(Path, BasicFileAttributes)]  {
+  // this method iterates (recursivly) over all files in a directory passes each one to a block (including it's attributes)
+  def foreach[U](f: ((Path, BasicFileAttributes)) => U) {   
+    class Visitor extends SimpleFileVisitor[Path] {
+      override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult = try {
+        f(file -> attrs)
+        FileVisitResult.CONTINUE
+      } catch { 
+        case x : Throwable => 
+         x.printStackTrace()
+         FileVisitResult.TERMINATE
+      }
+    }
+    Files.walkFileTree(path, new Visitor)
+  }
+  // this return's an easy to use Map, where relative paths are the keys and the attributes the values.
+  def attributeMap() =  map({ case (file,attr) => (path relativize file,attr) }).toMap
+}
+// Implicit conversation to make the file enumeration available to Path-Objects
+implicit def pathWrapper(path: Path) = new PathHelper(path)
+
+//########################
+// Actions
+//########################
+
+
+// an common class for representing the action to take for each file
+  abstract class SyncAction extends Ordered[SyncAction]{
+    // this executes the action (when a syncing solution is found)
+    def execute(info:SyncInfo,src:Path,dst:Path) {}
+    // this returns the space used after the action was executed.
+    // Could be negative if space is freed
+    def calcSpace(info:SyncInfo):Long = 0
+    // the execution order (so space can be freed before new files are copied)
+    // should be negative for actions that do nothing
+    def runOrder = -1
+    // returns if an actions does nothing (like keeping a file)
+    def isNoop = runOrder < 0
+    // a String explaining the action to the user
+    def describeAction (info:SyncInfo) = ""
+
+    
+
+    // comparision is done by runOrder so actions can be sorted by it
+    override def compare(other:SyncAction):Int = this.runOrder compareTo other.runOrder
+    
+    override def toString = this.getClass().getSimpleName();
+  }
+  
+  // First some Operations that change anything
+
+  // This file is only on the target and not old enough to be deleted
+  object Keep extends SyncAction {
+    override def describeAction(info:SyncInfo) = "(only on target)  keeping  "
+  }
+  // The timestamps of the files differ and it's newer in the target.
+  // Don't overwrite it in this case
+  object Newer extends SyncAction {
+    override def describeAction(info:SyncInfo) = "(newer on target) keeping  "
+  }
+  // The file already exists and is the same
+  object Existing extends SyncAction{
+    override def describeAction(info:SyncInfo) = "(same on target)  ignoring "
+  }
+  // This file is only in the source but to old to be copied
+  object Ignore extends SyncAction{
+    override def describeAction(info:SyncInfo) = "(too old)         ignoring "
+  }
+
+
+
+  // a CopyAction copies the file from the source to the destination
+  // this is used for new files but also when the content has changed
+  abstract class CopyAction extends SyncAction {
+    // take the size diffence of the two files
+    override def calcSpace(info:SyncInfo) = info.sizeDelta
+    
+    // create the needed directories in the target before copying
+    override def execute(info:SyncInfo,src:Path,dst:Path) {
+      val target = dst.resolve(info.name)
+      createTargetDirecory(target)
+      copyFile(src.resolve(info.name),target)
+    }
+    def createTargetDirecory(dst:Path) {
+     Files.createDirectories(dst.getParent())
+    }
+    def copyFile(srcFile:Path,destFile:Path)
+  }
+  
+  // create is used for new files, these files are written last
+  object Create extends CopyAction {
+    override def runOrder=2
+    override def copyFile(src:Path,dst:Path) = Files.copy(src,dst,StandardCopyOption.COPY_ATTRIBUTES)
+    override def describeAction(info:SyncInfo) = "(new file)        copying  "
+  }
+ 
+  // replaces a file, because it has a newer timestamp in the source directory
+  object Replace extends CopyAction {
+    override def runOrder=1
+    override def copyFile(src:Path,dst:Path) = Files.copy(src,dst,StandardCopyOption.COPY_ATTRIBUTES,StandardCopyOption.REPLACE_EXISTING)
+    override def describeAction(info:SyncInfo) = "(content changed) replacing"
+  }
+  
+  // deletes a file from the target because space is needed. Thats the first action to Perform.
+  object Remove extends SyncAction {
+    override def runOrder=0
+    override def execute(info:SyncInfo,src:Path,dst:Path) = Files.delete(dst.resolve(info.name))
+    override def calcSpace(info:SyncInfo):Long = -info.dstSize
+    override def describeAction(info:SyncInfo) = "(too old)         deleting "
+  }
+
+
+object AgeOrdering extends Ordering[SyncInfo] {
+  def compare(a:SyncInfo, b:SyncInfo) = a.syncAction compare b.syncAction
+}
+
+
+
+//########################
+// File-Pair Handling
+//########################
+
+
+
+// Represents a file pair. Needs a relative Path.
+// The attributes in the source and the target are optional and only given if the file exists in that location.
+// Holds the information, if a file should get copied to target (defaults to true).
+class SyncInfo(relPath:Path,srcAttr:Option[BasicFileAttributes],dstAttr:Option[BasicFileAttributes]) extends Ordered[SyncInfo] {
+  // file name
+  val name = relPath
+  // size in source
+  def srcSize = if (srcAttr.isEmpty) 0l else srcAttr.get.size
+  // size in target
+  def dstSize = if (dstAttr.isEmpty) 0l else dstAttr.get.size
+  // additional required space in target (after copying)
+  def sizeDelta = srcSize - dstSize
+  // should this file be in the target directory?
+  var addFiles = true
+
+  // returns the used space in a human readable form (with a unit)
+  def humanSpace = calcSpace match {
+    case i if i==0                   => s""
+    case i if Math.abs(i)<1000            => s"${i} B"
+    case i if Math.abs(i)<1000*1000       => s"${i / (1000)} KB"      
+    case i if Math.abs(i)<1000*1000 *1000 => s"${i / (1000*1000)} MB"  
+    case i                           => s"${i / (1000*1000*1000)} GB"
+  }
+  
+  // concatinates the space needed, the action description and the file name for a line in the output
+  override def toString = s"[${String.format("%-7s",humanSpace)}] ${syncAction.describeAction(this)} ${name}"
+  
+  // compares two SyncInfos. Ordering is first done by timestamp. If two files have the same, the filename is used
+  override def compare(other:SyncInfo):Int = {
+    val timestamps = this.timestamp compareTo other.timestamp
+    if (timestamps == 0) this.name compareTo other.name else timestamps //this is important to prevent data-loss in a SortedMap
+  }
+  // gets the latest last modified timestamp from any of the files
+  def timestamp =
+    if (srcAttr.isEmpty) dstAttr.get.lastModifiedTime
+    else if (dstAttr.isEmpty) srcAttr.get.lastModifiedTime
+    else if (dstAttr.get.lastModifiedTime.compareTo(srcAttr.get.lastModifiedTime)>0) dstAttr.get.lastModifiedTime
+    else srcAttr.get.lastModifiedTime
+  
+  // returns the right action when the file should be in the target directory
+  def syncActionAdd =
+    if      (srcAttr.isEmpty) Keep
+    else if (dstAttr.isEmpty) Create
+    else if (srcAttr.get.size()==dstAttr.get.size()) Existing
+    else if (dstAttr.get.lastModifiedTime.compareTo(srcAttr.get.lastModifiedTime)>0) Newer
+    else    Replace
+  
+  // returns the right action when the file should not be in the target directory
+  def syncActionRemove = if (syncActionAdd == Create) Ignore else Remove
+  
+  // selects the appropriate action, based on the addFile property 
+  def syncAction = if (addFiles) syncActionAdd else syncActionRemove
+  def isNoop = syncAction.isNoop
+  
+  // calculates the space change in the target. Positive means usage.
+  def calcSpace = syncAction.calcSpace(this)
+  
+  // executes the action
+  def execute(src:Path,dst:Path) =
+    syncAction.execute(this,src,dst)
+  
+  // sets whether the file should be copied or not.
+  // returns the the space difference caused by the decision
+  // Positive means usage.
+  def changeMode(adding:Boolean):Long = {
+    val old = calcSpace
+    addFiles = adding
+    calcSpace - old
+  }
+  
+}
+
+
+//########################
+// Main Logic
+//########################
+
+
+object FreshSync {
+  
+
+  
+  // Returns the available space in a directory
+  def availableSpace (dir:Path) =
+    Files.getFileStore(dir).getUsableSpace()
+    
+  // Takes a two Maps with file attributes and creates a single map with sync infos
+  def createSync(src : Map[Path, BasicFileAttributes],dst : Map[Path, BasicFileAttributes]) =
+   (src.keySet union dst.keySet).map(x => new SyncInfo(x,src get x,dst get x))
+
+  
+  
+  // Enforces a filepath to point to a directory and exits otherwise
+  def pathOrExit(path: String):Path = {
+    val p = Paths.get(path)
+    if (!Files.isDirectory(p)) {
+      System.err.println(path + " is not a directory")
+      System.exit(1)
+    }
+    p
+  }
+
+  // main methods
+  // needs two parameters: source and target path
+  // will quit if they are not present
+  def main(args: Array[String]) {
+    if (args.size != 2) {
+      System.err.println("usage: freshsynth <source> <target>")
+      System.exit(1)
+    }
+    val frompath = pathOrExit(args(0))
+    val topath = pathOrExit(args(1))
+    // enforce ordering by putting the file-pairs in a sorted set
+    val all = collection.SortedSet.empty[SyncInfo] ++ createSync(frompath.attributeMap(),topath.attributeMap())
+    // ideally we want all files in the target directory, calc the required space for that
+    var needed = all.foldLeft(0l)(_ + _.calcSpace)
+    // check whats actually available
+    val avail = availableSpace(topath)
+    
+    var it = all.iterator
+    // mark files (beginning by the old ones) as not to be present in the target directory until there is enough space.
+    while (needed>avail && it.hasNext) {
+      val x = it.next
+      needed += x.changeMode(false)
+    }
+    // execute all the actions
+    all.foreach{ x=>
+      println(x)
+      x.execute(frompath,topath)
+    }
+  }
+}
+
+//todo: datei und verzeichnis mit gleichem pfad
+
+FreshSync.main(args)
