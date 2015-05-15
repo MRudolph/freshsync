@@ -46,24 +46,14 @@ implicit def pathWrapper(path: Path) = new PathHelper(path)
 
 
 // an common class for representing the action to take for each file
-  abstract class SyncAction extends Ordered[SyncAction]{
+  abstract class SyncAction {
     // this executes the action (when a syncing solution is found)
     def execute(info:SyncInfo,src:Path,dst:Path) {}
     // this returns the space used after the action was executed.
     // Could be negative if space is freed
     def calcSpace(info:SyncInfo):Long = 0
-    // the execution order (so space can be freed before new files are copied)
-    // should be negative for actions that do nothing
-    def runOrder = -1
-    // returns if an actions does nothing (like keeping a file)
-    def isNoop = runOrder < 0
     // a String explaining the action to the user
     def describeAction (info:SyncInfo) = ""
-
-    
-
-    // comparision is done by runOrder so actions can be sorted by it
-    override def compare(other:SyncAction):Int = this.runOrder compareTo other.runOrder
     
     override def toString = this.getClass().getSimpleName();
   }
@@ -108,23 +98,20 @@ implicit def pathWrapper(path: Path) = new PathHelper(path)
     def copyFile(srcFile:Path,destFile:Path)
   }
   
-  // create is used for new files, these files are written last
+  // create is used for new files, these files must be written last
   object Create extends CopyAction {
-    override def runOrder=2
     override def copyFile(src:Path,dst:Path) = Files.copy(src,dst,StandardCopyOption.COPY_ATTRIBUTES)
     override def describeAction(info:SyncInfo) = "(new file)        copying  "
   }
  
   // replaces a file, because it has a newer timestamp in the source directory
   object Replace extends CopyAction {
-    override def runOrder=1
     override def copyFile(src:Path,dst:Path) = Files.copy(src,dst,StandardCopyOption.COPY_ATTRIBUTES,StandardCopyOption.REPLACE_EXISTING)
     override def describeAction(info:SyncInfo) = "(content changed) replacing"
   }
   
   // deletes a file from the target because space is needed. Thats the first action to Perform.
   object Remove extends SyncAction {
-    override def runOrder=0
     override def execute(info:SyncInfo,src:Path,dst:Path) = Files.delete(dst.resolve(info.name))
     override def calcSpace(info:SyncInfo):Long = -info.dstSize
     override def describeAction(info:SyncInfo) = "(too old)         deleting "
@@ -190,8 +177,7 @@ class SyncInfo(relPath:Path,srcAttr:Option[BasicFileAttributes],dstAttr:Option[B
   
   // selects the appropriate action, based on the addFile property 
   def syncAction = if (addFiles) syncActionAdd else syncActionRemove
-  def isNoop = syncAction.isNoop
-  
+
   // calculates the space change in the target. Positive means usage.
   def calcSpace = syncAction.calcSpace(this)
   
