@@ -21,6 +21,10 @@ Running with scala
 
 This is a standalone script. Having scala installed you can run it via
 
+    freshsync <dir1> <dir2>
+
+or, if shebangs don't work on your system
+
     scala freshsync <dir1> <dir2>
     
 to copy files from dir1 to dir2. It will print out a detailled report on which files were present and what was done with each one.
